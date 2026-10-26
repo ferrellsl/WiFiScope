@@ -3,7 +3,7 @@
 ;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\WiFiScope.iss
 ; (after building build\Release\WiFiScope.exe); the setup lands in installer\output.
 
-#define AppVersion "1.0"
+#define AppVersion "1.1"
 
 [Setup]
 AppId={{6B0E3C1D-5A4F-4F2B-9E7A-1D2C3B4A5F60}

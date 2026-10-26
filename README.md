@@ -1,8 +1,9 @@
 # WiFiScope
 
 A free Wi-Fi scanner for Windows: every network your adapter hears, in a table
-and on graphs of the 2.4, 5 and 6 GHz channels, so you can see which channels
-are crowded and pick a better one for your router.
+and on graphs of the 2.4, 5 and 6 GHz channels or of their signal over time,
+so you can see which channels are crowded and pick a better one for your
+router - WiFiScope suggests the quietest.
 
 ![WiFiScope](docs/wifiscope.png)
 
@@ -11,7 +12,8 @@ are crowded and pick a better one for your router.
 For each access point (each radio of each router):
 
 - **Name, BSSID and Vendor**: the radio's MAC address and who made it (from the
-  IEEE registry, built in). Your own network is marked with a dot. A ≡ after the BSSID marks a **Wi-Fi 7 multi-link** router.
+  IEEE registry, built in). Your own network is marked with a dot. A ≡ after
+  the BSSID marks a **Wi-Fi 7 multi-link** router.
   The vendor is whoever made the Wi-Fi hardware, which for many devices is a
   module maker (Foxconn / Hon Hai, Espressif, Realtek...) rather than the
   brand on the box. Made-up ("locally administered") addresses have no maker:
@@ -30,8 +32,32 @@ For each access point (each radio of each router):
 - **Seen**: how long ago its last beacon was heard. Networks not heard for 30
   seconds fade, and go after two minutes.
 
-The graphs draw each network across the channels it uses, as high as its
-signal, the way inSSIDer does. Click a row to pick it out on the graphs.
+Names starting with `DIRECT-` are **Wi-Fi Direct** networks that printers, TVs
+and streaming boxes make for themselves (screen mirroring, remotes, printing
+from phones). They use airtime on their channel like any other network.
+
+**By router** groups each router's radios - its 2.4, 5 and 6 GHz networks, its
+extra networks, the links of a Wi-Fi 7 multi-link device - under one row with
+their total clients; click the row to open or close it.
+
+## The graphs
+
+- **Channels** draws each network across the channels it uses, as high as its
+  signal, the way inSSIDer does. Above each band, **quietest** names the
+  channel that would be least crowded for a router of yours (shaded green): it
+  weighs every network heard - except your own router - by how loud it is, how
+  much of the channel it covers and how busy it says it is. On 5 GHz it says
+  when the quietest is a radar (DFS) channel, which routers must leave if
+  radar is heard, and names the best ordinary one too. Some devices can't use
+  every 5 GHz channel (149-165 especially), so check yours still connect after
+  a change.
+- **Signal over time** draws each network's signal over the last five minutes:
+  handy for watching a camera or extender that keeps dropping out.
+
+Click a row to pick it out on the graphs (a router's row picks out all its
+radios).
+
+![Signal over time](docs/wifiscope-time.png)
 
 ## Using it
 
@@ -41,20 +67,21 @@ signal, the way inSSIDer does. Click a row to pick it out on the graphs.
 - Drag the line between the table and the graphs to resize them.
 - Right-click for **Copy BSSID**, **Copy this row** or **Copy all rows**
   (tab-separated, for a spreadsheet), and **Scan now**.
-- Keys: **↑ ↓** select, **Esc** clear the selection, **Page Up/Down** scroll,
-  **F5** scan now.
+- Keys: **↑ ↓** select, **→** / **Enter** open a router, **←** close it,
+  **Esc** clear the selection, **Page Up/Down** scroll, **G** group by router,
+  **T** signal over time / channels, **F5** scan now.
 - **Sharing a screenshot?** Start it as `WiFiScope.exe --demo`: every network
   name is replaced by a made-up one and every address scrambled (a new random
   key each run), because BSSIDs can be looked up on Wi-Fi maps to find where
-  they are - and the names are your neighbors'. The screenshot above was made
-  that way.
+  they are - and the names are your neighbors'. The screenshots here were
+  made that way.
 
 It scans every five seconds; Windows decides when a scan actually happens, so
 some networks update less often.
 
 ## Download
 
-Get **WiFiScope-1.0-setup.exe** (installs for your user only, no admin rights
+Get **WiFiScope-1.1-setup.exe** (installs for your user only, no admin rights
 needed; adds a Start menu entry and an uninstaller) or just **WiFiScope.exe**
 (run it from anywhere) from the [Releases](../../releases) page. Neither is
 code-signed, so Windows SmartScreen may warn the first time: choose
@@ -93,7 +120,8 @@ Visual Studio 2019 or later with the C++ workload, and CMake:
     cmake -S . -B build -G "Visual Studio 16 2019" -A x64
     cmake --build build --config Release
 
-`build/Release/decode_test.exe` checks the beacon decoder (exit code = failures).
+`build/Release/decode_test.exe` checks the beacon decoder and the channel
+advice (exit code = failures).
 
 ## License
 

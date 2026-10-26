@@ -1,5 +1,6 @@
 // WiFiScope: a Wi-Fi scanner for Windows - every network the adapter hears, in
-// a table and on graphs of the 2.4, 5 and 6 GHz channels.
+// a table and on graphs of the 2.4, 5 and 6 GHz channels, or of their signal
+// over the last five minutes.
 //
 // Scanning: Windows' Native Wifi API (Wlan.cpp) asks for a scan every few
 // seconds; what each network's beacon says (width, generation, security,
@@ -20,10 +21,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
+#include "Advice.h"
 #include "Oui.h"
 #include "Wlan.h"
 
@@ -40,6 +44,7 @@ namespace {
   const int FadeAfterMs = 30000;           // not heard for this long: drawn faded
   const int DropAfterMs = 120000;          // ... and then gone from the list
   const int HistorySeconds = 300;
+  const int GapMs = 25000;                 // a signal line breaks where nothing was heard for this long
 
   // ------------------------------------------------------------- state
   struct Entry
@@ -51,9 +56,25 @@ namespace {
     std::deque<std::pair<ULONGLONG, int>> history;   // (time, dBm)
   };
   std::map<uint64_t, Entry> entries;       // key: the BSSID
-  std::vector<uint64_t> rows;              // the table's rows, filtered and sorted
   std::wstring connected;                  // our network's BSSID
   std::wstring adapter;
+
+  // The table's rows.  Grouped by router, a router with several radios (its
+  // bands, its extra networks, the links of a Wi-Fi 7 multi-link device) gets
+  // a summary row, with its radios under it when it's opened.
+  struct Group
+  {
+    uint64_t id = 0;                       // its first radio's BSSID (what "opened" remembers)
+    std::vector<uint64_t> members;         // sorted like the table
+    Entry summary;                         // what its summary row shows
+    std::wstring names, channels, bands;
+  };
+  struct Row { int group; uint64_t key; bool summary; };
+  std::vector<Group> groups;
+  std::vector<Row> rows;
+  std::vector<uint64_t> shown;             // every radio that passes the filter and the band switches
+  std::map<uint64_t, uint64_t> groupOf;    // radio -> its group's id
+  std::set<uint64_t> opened;               // groups shown open
 
   HWND window = nullptr, filterBox = nullptr;
   HBRUSH editBrush = nullptr;
@@ -75,7 +96,10 @@ namespace {
   int sortColumn = ColSignal;
   bool sortDown = true;                    // (signal: strongest first)
   bool showBand[3] = { true, true, true }; // 2.4, 5, 6 GHz
-  uint64_t selected = 0;                   // 0: none
+  bool grouped = false;                    // the table by router
+  bool timeView = false;                   // the graphs: signal over time instead of channels
+  uint64_t selected = 0;                   // a radio, or 0
+  uint64_t selectedGroup = 0;              // a router's group (its summary row), or 0
   int scroll = 0;                          // the table's first row
   float split = 0.52f;                     // the table's share of the height
   bool dragging = false;
@@ -85,7 +109,7 @@ namespace {
 
   // the layout, set by layout()
   float W = 0, H = 0, top = 0, tableTop = 0, tableBottom = 0, rowH = 0, headH = 0, graphTop = 0;
-  D2D1_RECT_F bandPill[3];
+  D2D1_RECT_F bandPill[3], groupPill, viewTab[2];
   struct Pane { int band; float x0, x1; double f0, f1; };
   std::vector<Pane> panes;
 
@@ -138,6 +162,7 @@ namespace {
   }
 
   int bandIndex(int band) { return band == 2 ? 0 : band == 5 ? 1 : 2; }
+  const wchar_t * bandName(int band) { return band == 2 ? L"2.4" : band == 5 ? L"5" : L"6"; }
 
   std::wstring wifiName(const wlan::Bss & b)
   {
@@ -156,6 +181,8 @@ namespace {
     return mbps >= 100 ? format(L"%.0f", mbps) : format(L"%.1f", mbps);
   }
 
+  std::wstring nameOf(const wlan::Bss & b) { return b.ssid.empty() ? L"(hidden)" : b.ssid; }
+
   // ------------------------------------------------------------- settings
   void saveSettings()
   {
@@ -163,6 +190,8 @@ namespace {
     put(L"Sort", format(L"%s %d", columns[sortColumn].name, sortDown ? 1 : 0));
     put(L"Bands", format(L"%d %d %d", showBand[0], showBand[1], showBand[2]));
     put(L"Split", format(L"%.3f", split));
+    put(L"Grouped", grouped ? L"1" : L"0");
+    put(L"Graph", timeView ? L"time" : L"channels");
     WINDOWPLACEMENT wp = { sizeof(wp) };
     if (GetWindowPlacement(window, &wp)) {
       const RECT & r = wp.rcNormalPosition;
@@ -178,6 +207,9 @@ namespace {
   }
 
   // ------------------------------------------------------------- the data
+  // Two addresses of one router: routers make their other radios' and extra
+  // networks' addresses from their own by changing a byte or two - here: the
+  // second and third bytes the same, and at least four of the last five.
   bool sibling(const uint8_t * a, const uint8_t * b)
   {
     if (a[1] != b[1] || a[2] != b[2]) return false;
@@ -186,21 +218,40 @@ namespace {
     return same >= 4;
   }
 
+  bool connectedMac(uint8_t * m)
+  {
+    if (connected.size() != 17) return false;
+    for (int i = 0; i < 6; ++i) m[i] = (uint8_t) wcstoul(connected.substr(i * 3, 2).c_str(), nullptr, 16);
+    return true;
+  }
+
   // Demo mode (WiFiScope --demo), for screenshots that can be shared: every
-  // name is replaced by a made-up one and the last three bytes of every
-  // address by a hash with a salt chosen at random each run - so neither the
-  // neighbors' names nor the addresses (which Wi-Fi maps can locate) show.
-  // The makers' part of the addresses stays, so the Vendor column still works.
+  // name is replaced by a made-up one, and each of the last three bytes of
+  // every address goes through its own shuffled table, made at random each
+  // run - so neither the neighbors' names nor the addresses (which Wi-Fi maps
+  // can locate) show.  Bytes that were the same stay the same, so a router's
+  // radios still group together; the makers' part of the addresses stays, so
+  // the Vendor column still works.
   bool demo = false;
   uint64_t demoSalt = 0;
+  uint8_t demoTable[3][256];
   std::map<std::wstring, std::wstring> demoNames;
+
+  void makeDemoTables()
+  {
+    for (auto & t : demoTable) {
+      for (int i = 0; i < 256; ++i) t[i] = (uint8_t) i;
+      for (int i = 255; i > 0; --i) {
+        unsigned int r = 0;
+        rand_s(&r);
+        std::swap(t[i], t[r % (i + 1)]);
+      }
+    }
+  }
 
   void disguise(uint8_t * mac)
   {
-    uint64_t h = demoSalt;
-    for (int i = 0; i < 6; ++i) h = (h ^ mac[i]) * 0x100000001B3ull;
-    h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 32;
-    mac[3] = (uint8_t) h; mac[4] = (uint8_t) (h >> 8); mac[5] = (uint8_t) (h >> 16);
+    for (int i = 3; i < 6; ++i) mac[i] = demoTable[i - 3][mac[i]];
   }
 
   void disguise(wlan::Bss & b)
@@ -252,19 +303,16 @@ namespace {
       else ++it;
     }
     connected = wlan::connectedBssid();
-    if (demo && connected.size() == 17) {
-      uint8_t m[6];
-      for (int i = 0; i < 6; ++i) m[i] = (uint8_t) wcstoul(connected.substr(i * 3, 2).c_str(), nullptr, 16);
+    uint8_t m[6];
+    if (demo && connectedMac(m)) {
       disguise(m);
       connected = macText(m);
     }
 
     // the makers.  A made-up ("locally administered") address has none of its
-    // own: if another network's registered address shares its second and third
-    // bytes and at least four of its last five, it's that router's extra network
-    // (guest, IoT, mesh - routers make those addresses from their own by
-    // changing a byte or two); otherwise it's a private address (a phone's
-    // hotspot and the like)
+    // own: if it is a sibling of another network's registered address, it's
+    // that router's extra network (guest, IoT, mesh); otherwise it's a private
+    // address (a phone's hotspot and the like)
     for (auto & [key, e] : entries) {
       if (!e.vendor.empty() && !oui::local(e.bss.mac)) continue;   // (made-up ones: again, as their router may be heard later)
       if (!oui::local(e.bss.mac)) {
@@ -281,54 +329,172 @@ namespace {
     }
   }
 
+  // our own router: the radio we're connected to, and its siblings
+  bool ours(const Entry & e)
+  {
+    uint8_t m[6];
+    return connectedMac(m) && (memcmp(m, e.bss.mac, 6) == 0 || sibling(m, e.bss.mac));
+  }
+
+  // the quietest channel for each band, from everything heard but our own router
+  std::vector<advice::Choice> suggestions(int band)
+  {
+    std::vector<advice::Radio> radios;
+    for (auto & [k, e] : entries) {
+      if (ours(e)) continue;
+      advice::Radio r;
+      r.band = e.bss.band; r.center = e.bss.center; r.width = e.bss.width;
+      r.center2 = e.bss.split ? e.bss.center2 : 0;
+      if (e.bss.split) r.width = 80;
+      r.rssi = e.bss.rssi; r.utilization = e.bss.utilization;
+      radios.push_back(r);
+    }
+    return advice::rank(band, radios);
+  }
+
+  // sorting: <0, 0, >0 for the table's column (ascending)
+  int compare(const Entry & x, const Entry & y, uint64_t a, uint64_t b)
+  {
+    auto value = [](const Entry & e, int c) -> double {
+      const wlan::Bss & s = e.bss;
+      switch (c) {
+        case ColSignal: return s.rssi;
+        case ColChannel: return s.band * 1000 + s.channel;
+        case ColWidth: return s.width;
+        case ColBand: return s.band;
+        case ColWifi: return s.generation * 10 + (s.band == 6);
+        case ColMax: return s.maxRate;
+        case ColMin: return s.minRate;
+        case ColClients: return s.stations;
+        case ColUtil: return s.utilization;
+        case ColSeen: return -(double) e.heard;
+        default: return 0;
+      }
+    };
+    auto text = [](const std::wstring & p, const std::wstring & q) {   // (empty ones last)
+      const std::wstring lp = lower(p), lq = lower(q);
+      return lp == lq ? 0 : lp.empty() ? 1 : lq.empty() ? -1 : (lp < lq ? -1 : 1);
+    };
+    switch (sortColumn) {
+      case ColSsid: return text(x.bss.ssid, y.bss.ssid);
+      case ColBssid: return a < b ? -1 : a > b ? 1 : 0;
+      case ColVendor: return text(x.vendor, y.vendor);
+      case ColSecurity: return text(x.bss.security, y.bss.security);
+      default: {
+        const double vx = value(x, sortColumn), vy = value(y, sortColumn);
+        return vx < vy ? -1 : vx > vy ? 1 : 0;
+      }
+    }
+  }
+
+  bool before(const Entry & x, const Entry & y, uint64_t a, uint64_t b)
+  {
+    const int order = compare(x, y, a, b);
+    if (order == 0) return x.bss.rssi > y.bss.rssi || (x.bss.rssi == y.bss.rssi && a < b);
+    return sortDown ? order > 0 : order < 0;
+  }
+
+  // The rows: filtered, grouped by router when that's on, and sorted.
   void sortRows()
   {
     const std::wstring f = lower(filter);
-    rows.clear();
+    shown.clear();
     for (auto & [key, e] : entries) {
       if (!showBand[bandIndex(e.bss.band)]) continue;
       if (!f.empty() && lower(e.bss.ssid).find(f) == std::wstring::npos && macText(e.bss.mac).find(f) == std::wstring::npos &&
           lower(e.vendor).find(f) == std::wstring::npos)
         continue;
-      rows.push_back(key);
+      shown.push_back(key);
     }
-    auto value = [](const Entry & e, int c) -> double {
-      const wlan::Bss & b = e.bss;
-      switch (c) {
-        case ColSignal: return b.rssi;
-        case ColChannel: return b.band * 1000 + b.channel;
-        case ColWidth: return b.width;
-        case ColBand: return b.band;
-        case ColWifi: return b.generation * 10 + (b.band == 6);
-        case ColMax: return b.maxRate;
-        case ColMin: return b.minRate;
-        case ColClients: return b.stations;
-        case ColUtil: return b.utilization;
-        case ColSeen: return -(double) e.heard;
-        default: return 0;
+    std::sort(shown.begin(), shown.end(), [](uint64_t a, uint64_t b) { return before(entries[a], entries[b], a, b); });
+
+    // the groups: radios joined when their addresses are siblings, or when
+    // they are links of the same Wi-Fi 7 multi-link device
+    std::map<uint64_t, uint64_t> parent;
+    std::function<uint64_t(uint64_t)> find = [&](uint64_t k) { uint64_t & p = parent[k]; if (p == 0 || p == k) { p = k; return k; } return p = find(p); };
+    for (uint64_t k : shown) find(k);
+    if (grouped)
+      for (size_t i = 0; i < shown.size(); ++i)
+        for (size_t j = i + 1; j < shown.size(); ++j) {
+          const wlan::Bss & p = entries[shown[i]].bss, & q = entries[shown[j]].bss;
+          if (sibling(p.mac, q.mac) || (p.multiLink && q.multiLink && memcmp(p.mld, q.mld, 6) == 0)) {
+            const uint64_t a = find(shown[i]), b = find(shown[j]);
+            if (a != b) parent[std::max(a, b)] = std::min(a, b);
+          }
+        }
+    groups.clear();
+    groupOf.clear();
+    std::map<uint64_t, size_t> index;
+    for (uint64_t k : shown) {               // (in table order: each group's radios sorted too)
+      const uint64_t root = find(k);
+      auto it = index.find(root);
+      if (it == index.end()) {
+        it = index.emplace(root, groups.size()).first;
+        groups.push_back(Group());
+        groups.back().id = root;
       }
-    };
-    std::sort(rows.begin(), rows.end(), [&](uint64_t a, uint64_t b) {
-      const Entry & x = entries[a], & y = entries[b];
-      int order = 0;
-      if (sortColumn == ColSsid) {
-        const std::wstring sx = lower(x.bss.ssid), sy = lower(y.bss.ssid);
-        if (sx != sy) order = sx.empty() ? 1 : sy.empty() ? -1 : (sx < sy ? -1 : 1);   // (hidden ones last)
+      groups[it->second].members.push_back(k);
+      groupOf[k] = root;
+    }
+
+    // what a router's summary row shows: its strongest radio, with the
+    // others' channels, bands and names added
+    for (Group & g : groups) {
+      const Entry & first = entries[g.members.front()];
+      Entry s = first;
+      for (uint64_t k : g.members) if (entries[k].bss.rssi > s.bss.rssi) s = entries[k];
+      std::vector<std::wstring> names, channels;
+      bool band[3] = {};
+      int stations = -1;
+      for (uint64_t k : g.members) {
+        const Entry & e = entries[k];
+        const wlan::Bss & b = e.bss;
+        if (!b.ssid.empty() && std::find(names.begin(), names.end(), b.ssid) == names.end()) names.push_back(b.ssid);
+        const std::wstring ch = format(L"%d", b.channel);
+        if (std::find(channels.begin(), channels.end(), ch) == channels.end()) channels.push_back(ch);
+        band[bandIndex(b.band)] = true;
+        s.heard = std::max(s.heard, e.heard);
+        s.bss.width = std::max(s.bss.width, b.width);
+        s.bss.maxRate = std::max(s.bss.maxRate, b.maxRate);
+        s.bss.minRate = std::min(s.bss.minRate, b.minRate);
+        s.bss.utilization = std::max(s.bss.utilization, b.utilization);
+        if (b.generation > s.bss.generation) s.bss.generation = b.generation;
+        if (b.stations >= 0) stations = std::max(0, stations) + b.stations;
+        if (oui::local(s.bss.mac) && !oui::local(b.mac)) { s.vendor = e.vendor; memcpy(s.bss.mac, b.mac, 6); }
       }
-      else if (sortColumn == ColBssid) order = a < b ? -1 : a > b ? 1 : 0;
-      else if (sortColumn == ColVendor) {
-        const std::wstring vx = lower(x.vendor), vy = lower(y.vendor);
-        if (vx != vy) order = vx.empty() ? 1 : vy.empty() ? -1 : (vx < vy ? -1 : 1);
-      }
-      else if (sortColumn == ColSecurity) order = x.bss.security < y.bss.security ? -1 : x.bss.security > y.bss.security ? 1 : 0;
-      else {
-        const double vx = value(x, sortColumn), vy = value(y, sortColumn);
-        order = vx < vy ? -1 : vx > vy ? 1 : 0;
-      }
-      if (order == 0) return x.bss.rssi > y.bss.rssi || (x.bss.rssi == y.bss.rssi && a < b);
-      return sortDown ? order > 0 : order < 0;
+      s.bss.stations = stations;
+      s.bss.ssid = names.empty() ? L"" : names[0];
+      g.names = names.empty() ? L"(hidden)" : names[0];
+      for (size_t i = 1; i < names.size() && i < 3; ++i) g.names += L", " + names[i];
+      if (names.size() > 3) g.names += format(L" +%d", (int) names.size() - 3);
+      for (size_t i = 0; i < channels.size(); ++i) g.channels += (i ? L", " : L"") + channels[i];
+      for (int i = 0; i < 3; ++i) if (band[i]) g.bands += (g.bands.empty() ? L"" : L"+") + std::wstring(bandName(i == 0 ? 2 : i == 1 ? 5 : 6));
+      g.summary = s;
+    }
+    std::stable_sort(groups.begin(), groups.end(), [](const Group & a, const Group & b) {
+      return before(a.summary, b.summary, a.id, b.id);
     });
+
+    rows.clear();
+    for (size_t i = 0; i < groups.size(); ++i) {
+      const Group & g = groups[i];
+      if (g.members.size() == 1) { rows.push_back({ (int) i, g.members[0], false }); continue; }
+      rows.push_back({ (int) i, g.id, true });
+      if (opened.count(g.id))
+        for (uint64_t k : g.members) rows.push_back({ (int) i, k, false });
+    }
+    if (selectedGroup && !std::any_of(groups.begin(), groups.end(), [](const Group & g) { return g.id == selectedGroup && g.members.size() > 1; }))
+      selectedGroup = 0;
   }
+
+  bool highlighted(uint64_t key)
+  {
+    if (key == selected) return true;
+    if (!selectedGroup) return false;
+    auto it = groupOf.find(key);
+    return it != groupOf.end() && it->second == selectedGroup;
+  }
+  bool anySelection() { return selected || selectedGroup; }
 
   // ------------------------------------------------------------- drawing
   void text(const std::wstring & s, IDWriteTextFormat * f, D2D1_RECT_F r, uint32_t color, float alpha = 1,
@@ -353,6 +519,8 @@ namespace {
     return w;
   }
 
+  bool inside(const D2D1_RECT_F & r, float x, float y) { return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom; }
+
   void layout()
   {
     RECT r;
@@ -366,19 +534,22 @@ namespace {
     tableBottom = top + std::max(headH + rowH * 3, std::min(graphs - 140 * ui, graphs * split));
     graphTop = tableBottom + 8 * ui;
 
-    // the band switches, top right
+    // the band switches and "By router", top right
     float x = W - 10 * ui;
-    const wchar_t * names[3] = { L"6 GHz", L"5 GHz", L"2.4 GHz" };
     for (int i = 2; i >= 0; --i) {
       const float w = 64 * ui;
       bandPill[i] = D2D1::RectF(x - w, 10 * ui, x, 34 * ui);
       x -= w + 6 * ui;
-      (void) names;
     }
+    groupPill = D2D1::RectF(x - 84 * ui, 10 * ui, x, 34 * ui);
+    x -= 84 * ui + 10 * ui;
     if (filterBox) {
       const int fw = (int) (240 * ui);
-      MoveWindow(filterBox, (int) (x - fw - 10 * ui), (int) (11 * ui), fw, (int) (22 * ui), TRUE);
+      MoveWindow(filterBox, (int) (x - fw), (int) (11 * ui), fw, (int) (22 * ui), TRUE);
     }
+    // the graph switch, right of the graphs' titles
+    viewTab[1] = D2D1::RectF(W - 10 * ui - 128 * ui, graphTop, W - 10 * ui, graphTop + 18 * ui);
+    viewTab[0] = D2D1::RectF(viewTab[1].left - 4 * ui - 84 * ui, graphTop, viewTab[1].left - 4 * ui, graphTop + 18 * ui);
 
     // the channel graphs: 2.4 | 5 | 6 GHz, side by side, sized by how much there is to see
     panes.clear();
@@ -399,6 +570,14 @@ namespace {
     }
   }
 
+  void pill(const D2D1_RECT_F & r, const wchar_t * label, bool on)
+  {
+    brush->SetColor(rgb(on ? 0x2E86DE : 0x2A3540));
+    target->FillRoundedRectangle(D2D1::RoundedRect(r, (r.bottom - r.top) / 2, (r.bottom - r.top) / 2), brush);
+    text(label, fontSmall, D2D1::RectF(r.left, r.top + (r.bottom - r.top - 16 * ui) / 2, r.right, r.bottom), on ? 0xFFFFFF : 0x8FA3B8, 1,
+         DWRITE_TEXT_ALIGNMENT_CENTER);
+  }
+
   void drawTop()
   {
     brush->SetColor(rgb(0x141A21));
@@ -408,15 +587,17 @@ namespace {
     const ULONGLONG now = GetTickCount64();
     for (auto & [k, e] : entries) if (e.heard + FadeAfterMs < now) ++fading;
     std::wstring status = format(L"%d networks", (int) entries.size() - fading);
-    if (!adapter.empty()) status += L"   •   " + adapter;
-    text(status, fontSmall, D2D1::RectF(130 * ui, 15 * ui, bandPill[0].left - 260 * ui, 34 * ui), 0x9FB0C2);
-    const wchar_t * names[3] = { L"2.4 GHz", L"5 GHz", L"6 GHz" };
-    for (int i = 0; i < 3; ++i) {
-      brush->SetColor(rgb(showBand[i] ? 0x2E86DE : 0x2A3540));
-      target->FillRoundedRectangle(D2D1::RoundedRect(bandPill[i], 11 * ui, 11 * ui), brush);
-      text(names[i], fontSmall, D2D1::RectF(bandPill[i].left, bandPill[i].top + 4 * ui, bandPill[i].right, bandPill[i].bottom),
-           showBand[i] ? 0xFFFFFF : 0x8FA3B8, 1, DWRITE_TEXT_ALIGNMENT_CENTER);
+    if (grouped) {
+      int routers = 0;
+      for (const Group & g : groups) if (g.summary.heard + FadeAfterMs >= now) ++routers;
+      status += format(L", %d routers", routers);
     }
+    if (!adapter.empty()) status += L"   •   " + adapter;
+    if (demo) status += L"   •   demo: names and addresses disguised";
+    text(status, fontSmall, D2D1::RectF(130 * ui, 15 * ui, groupPill.left - 260 * ui, 34 * ui), 0x9FB0C2);
+    pill(groupPill, L"By router", grouped);
+    const wchar_t * names[3] = { L"2.4 GHz", L"5 GHz", L"6 GHz" };
+    for (int i = 0; i < 3; ++i) pill(bandPill[i], names[i], showBand[i]);
   }
 
   float columnX(int c)
@@ -445,16 +626,26 @@ namespace {
 
     const int visible = visibleRows();
     scroll = std::max(0, std::min(scroll, (int) rows.size() - visible));
+    uint8_t ourMac[6];
+    const bool haveOurs = connectedMac(ourMac);
     target->PushAxisAlignedClip(D2D1::RectF(0, tableTop + headH, W, tableBottom), D2D1_ANTIALIAS_MODE_ALIASED);
     for (int i = 0; i < visible && scroll + i < (int) rows.size(); ++i) {
-      const uint64_t key = rows[scroll + i];
-      const Entry & e = entries[key];
+      const Row & row = rows[scroll + i];
+      const Group & g = groups[row.group];
+      const Entry & e = row.summary ? g.summary : entries[row.key];
       const wlan::Bss & b = e.bss;
+      const bool child = !row.summary && g.members.size() > 1;
       const float y = tableTop + headH + i * rowH;
       const bool faded = e.heard + FadeAfterMs < now;
-      const bool ours = macText(b.mac) == connected;
-      if (key == selected) {
-        brush->SetColor(rgb(0x2E86DE, 0.35f));
+      bool mine = haveOurs && memcmp(ourMac, b.mac, 6) == 0;
+      if (row.summary) for (uint64_t k : g.members) mine = mine || (haveOurs && memcmp(ourMac, entries[k].bss.mac, 6) == 0);
+      const bool picked = row.summary ? selectedGroup == g.id : (row.key == selected || (selectedGroup && selectedGroup == g.id));
+      if (picked) {
+        brush->SetColor(rgb(0x2E86DE, row.summary || row.key == selected ? 0.35f : 0.18f));
+        target->FillRectangle(D2D1::RectF(0, y, W, y + rowH), brush);
+      }
+      else if (row.summary) {
+        brush->SetColor(rgb(0xFFFFFF, 0.05f));
         target->FillRectangle(D2D1::RectF(0, y, W, y + rowH), brush);
       }
       else if (i % 2) {
@@ -462,18 +653,29 @@ namespace {
         target->FillRectangle(D2D1::RectF(0, y, W, y + rowH), brush);
       }
       brush->SetColor(rgb(e.color, faded ? 0.35f : 1));
-      target->FillRectangle(D2D1::RectF(6 * ui, y + 4 * ui, 14 * ui, y + rowH - 4 * ui), brush);
+      target->FillRectangle(D2D1::RectF((child ? 12 : 6) * ui, y + 4 * ui, (child ? 16 : 14) * ui, y + rowH - 4 * ui), brush);
       const float alpha = faded ? 0.45f : 1;
       const uint32_t fg = 0xE8EEF4, dim = 0x9FB0C2;
-      auto cell = [&](int c, const std::wstring & s, uint32_t color, IDWriteTextFormat * f = nullptr) {
-        const float x = columnX(c), w = columns[c].width * ui;
+      auto cell = [&](int c, const std::wstring & s, uint32_t color, IDWriteTextFormat * f = nullptr, float indent = 0) {
+        const float x = columnX(c) + indent, w = columns[c].width * ui - indent;
         text(s, f ? f : fontText, D2D1::RectF(x + 4 * ui, y + 3 * ui, x + w - 6 * ui, y + rowH), color, alpha,
              columns[c].right ? DWRITE_TEXT_ALIGNMENT_TRAILING : DWRITE_TEXT_ALIGNMENT_LEADING);
       };
-      std::wstring name = b.ssid.empty() ? L"(hidden)" : b.ssid;
-      if (ours) name = L"● " + name;
-      cell(ColSsid, name, b.ssid.empty() ? dim : fg, ours ? fontBold : nullptr);
-      cell(ColBssid, macText(b.mac) + (b.multiLink ? L" ≡" : L""), dim);
+      if (row.summary) {
+        const bool open = opened.count(g.id) != 0;
+        cell(ColSsid, std::wstring(open ? L"▾ " : L"▸ ") + (mine ? L"● " : L"") + g.names, fg, fontBold);
+        cell(ColBssid, format(L"%d radios", (int) g.members.size()), dim);
+        cell(ColChannel, g.channels, fg);
+        cell(ColBand, g.bands, dim);
+      }
+      else {
+        std::wstring name = nameOf(b);
+        if (mine) name = L"● " + name;
+        cell(ColSsid, name, b.ssid.empty() ? dim : fg, mine ? fontBold : nullptr, child ? 16 * ui : 0);
+        cell(ColBssid, macText(b.mac) + (b.multiLink ? L" ≡" : L""), dim);
+        cell(ColChannel, format(L"%d", b.channel), fg);
+        cell(ColBand, bandName(b.band), dim);
+      }
       cell(ColVendor, e.vendor, oui::local(b.mac) ? 0x8FA3B8 : 0xC8D6E5);
       // signal: the number, and a bar from -95 to -35 dBm
       {
@@ -486,9 +688,7 @@ namespace {
         target->FillRectangle(D2D1::RectF(x, y + 8 * ui, x + bw * t, y + rowH - 8 * ui), brush);
         text(format(L"%d", b.rssi), fontText, D2D1::RectF(x + bw + 6 * ui, y + 3 * ui, x + columns[ColSignal].width * ui, y + rowH), fg, alpha);
       }
-      cell(ColChannel, format(L"%d", b.channel), fg);
       cell(ColWidth, b.split ? L"80+80" : format(L"%d", b.width), fg);
-      cell(ColBand, b.band == 2 ? L"2.4" : b.band == 5 ? L"5" : L"6", dim);
       cell(ColWifi, wifiName(b), b.generation >= 7 ? 0xFFD166 : fg);
       cell(ColSecurity, b.security, b.security == L"Open" || b.security == L"WEP" ? 0xFFB4A2 : fg);
       cell(ColMax, rateText(b.maxRate), fg);
@@ -513,25 +713,95 @@ namespace {
     target->FillRectangle(D2D1::RectF(0, tableBottom, W, tableBottom + 3 * ui), brush);
   }
 
-  void drawPane(const Pane & p)
-  {
-    const ULONGLONG now = GetTickCount64();
-    const float x0 = p.x0, x1 = p.x1;
-    const float y0 = graphTop + 20 * ui, y1 = H - 26 * ui;
-    const float ax = x0 + 34 * ui;                                   // (dBm labels on the left)
-    auto fx = [&](double mhz) { return (float) (ax + (mhz - p.f0) / (p.f1 - p.f0) * (x1 - ax)); };
-    const double dbTop = -20, dbBottom = -100;
-    auto fy = [&](double db) { return (float) (y0 + (dbTop - db) / (dbTop - dbBottom) * (y1 - y0)); };
+  // The networks' names on a graph: the selected ones and the strongest placed
+  // first, just above their point; one that would overlap another moves up a
+  // line, or down, with a thin line to its point when it has moved.  Names
+  // with no room left are skipped (the table has them).
+  struct Label { uint64_t key; float x, y, alpha; bool right; };
 
-    text(p.band == 2 ? L"2.4 GHz" : p.band == 5 ? L"5 GHz" : L"6 GHz", fontBold, D2D1::RectF(x0, graphTop, x1, y0), 0xB8C6D6);
+  void placeLabels(std::vector<Label> & names, float left, float right, float top, float bottom)
+  {
+    std::sort(names.begin(), names.end(), [](const Label & a, const Label & b) {
+      if (highlighted(a.key) != highlighted(b.key)) return highlighted(a.key);
+      return a.y < b.y;
+    });
+    std::vector<D2D1_RECT_F> placed;
+    const float lh = 15 * ui;
+    for (const Label & l : names) {
+      const Entry & e = entries[l.key];
+      const std::wstring name = nameOf(e.bss);
+      const float tw = textWidth(name, fontSmall) + 8 * ui;
+      const float x = l.right ? std::min(right - tw - 1, l.x + 4 * ui) : std::max(left + 1, std::min(right - tw - 1, l.x - tw / 2));
+      D2D1_RECT_F box = {};
+      bool found = false;
+      for (int step : { 0, -1, -2, -3, 1, 2, 3, 4, -4, 5, 6 }) {
+        const float y = (l.right ? l.y - lh / 2 : l.y - 17 * ui) + step * (lh + 1 * ui);
+        if (y < top - 17 * ui || y + lh > bottom) continue;
+        const D2D1_RECT_F r = D2D1::RectF(x, y, x + tw, y + lh);
+        bool clash = false;
+        for (const auto & q : placed)
+          if (r.left < q.right && q.left < r.right && r.top < q.bottom && q.top < r.bottom) { clash = true; break; }
+        if (!clash) { box = r; found = true; break; }
+      }
+      if (!found) continue;
+      placed.push_back(box);
+      const float home = l.right ? l.y - lh / 2 : l.y - 17 * ui;
+      if (std::fabs(box.top - home) > 1 * ui) {
+        brush->SetColor(rgb(e.color, 0.5f * l.alpha));
+        const float ly = box.bottom < l.y ? box.bottom : box.top;
+        if (l.right) target->DrawLine(D2D1::Point2F(l.x, l.y), D2D1::Point2F(box.left, (box.top + box.bottom) / 2), brush, 1);
+        else target->DrawLine(D2D1::Point2F(l.x, ly), D2D1::Point2F(l.x, l.y), brush, 1);
+      }
+      brush->SetColor(rgb(0x0E1318, 0.8f * l.alpha));
+      target->FillRectangle(box, brush);
+      text(name, fontSmall, D2D1::RectF(box.left, box.top + 1 * ui, box.right, box.bottom), e.color, l.alpha, DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+  }
+
+  const double dbTop = -20, dbBottom = -100;
+
+  void drawDbGrid(float x0, float ax, float x1, float y0, float y1)
+  {
+    auto fy = [&](double db) { return (float) (y0 + (dbTop - db) / (dbTop - dbBottom) * (y1 - y0)); };
     brush->SetColor(rgb(0x0E1318));
     target->FillRectangle(D2D1::RectF(ax, y0, x1, y1), brush);
-    // grid: every 10 dBm, and the channels
     for (int db = -30; db >= -90; db -= 10) {
       brush->SetColor(rgb(0xFFFFFF, 0.07f));
       target->DrawLine(D2D1::Point2F(ax, fy(db)), D2D1::Point2F(x1, fy(db)), brush, 1);
       text(format(L"%d", db), fontSmall, D2D1::RectF(x0, fy(db) - 8 * ui, ax - 4 * ui, fy(db) + 8 * ui), 0x8FA3B8, 1, DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
+  }
+
+  void drawPane(const Pane & p)
+  {
+    const ULONGLONG now = GetTickCount64();
+    const float x0 = p.x0, x1 = p.x1;
+    const float y0 = graphTop + 22 * ui, y1 = H - 26 * ui;
+    const float ax = x0 + 34 * ui;                                   // (dBm labels on the left)
+    auto fx = [&](double mhz) { return (float) (ax + (mhz - p.f0) / (p.f1 - p.f0) * (x1 - ax)); };
+    auto fy = [&](double db) { return (float) (y0 + (dbTop - db) / (dbTop - dbBottom) * (y1 - y0)); };
+
+    // the title, and the quietest channel for a router of yours
+    const std::wstring title = p.band == 2 ? L"2.4 GHz" : p.band == 5 ? L"5 GHz" : L"6 GHz";
+    text(title, fontBold, D2D1::RectF(x0, graphTop, x1, y0), 0xB8C6D6);
+    const std::vector<advice::Choice> best = suggestions(p.band);
+    if (!best.empty()) {
+      const advice::Choice & c = best[0];
+      std::wstring hint = c.first == c.last ? format(L"quietest: %d", c.first) : format(L"quietest: %d–%d (%d MHz)", c.first, c.last, c.width);
+      if (p.band == 5 && c.dfs) {
+        // (a radar channel: say which ordinary one comes next)
+        for (const advice::Choice & o : best) if (!o.dfs) { hint += format(L", radar rules; or %d–%d", o.first, o.last); break; }
+      }
+      const float tx = x0 + textWidth(title, fontBold) + 12 * ui;
+      const float limit = (p.x1 >= viewTab[0].left - 4 * ui) ? viewTab[0].left - 8 * ui : x1;
+      text(hint, fontSmall, D2D1::RectF(tx, graphTop + 2 * ui, limit, y0), 0x7FD88F);
+      const float l = fx(c.center - c.width / 2.0), r = fx(c.center + c.width / 2.0);
+      drawDbGrid(x0, ax, x1, y0, y1);
+      brush->SetColor(rgb(0x2ECC71, 0.07f));
+      target->FillRectangle(D2D1::RectF(std::max(ax, l), y0, std::min(x1, r), y1), brush);
+    }
+    else drawDbGrid(x0, ax, x1, y0, y1);
+
     std::vector<int> labels;
     if (p.band == 2) for (int c = 1; c <= 14; ++c) labels.push_back(c);
     else if (p.band == 5) labels = { 36, 44, 52, 60, 100, 108, 116, 124, 132, 140, 149, 157, 165, 173 };
@@ -544,21 +814,20 @@ namespace {
     }
 
     // the networks: one shape across each one's channel, as high as its signal
-    // (strongest drawn last, on top; the selected one last of all)
+    // (strongest drawn last, on top; the selected ones last of all)
     std::vector<uint64_t> order;
-    for (uint64_t k : rows) if (entries[k].bss.band == p.band) order.push_back(k);
+    for (uint64_t k : shown) if (entries[k].bss.band == p.band) order.push_back(k);
     std::sort(order.begin(), order.end(), [&](uint64_t a, uint64_t b) {
-      if ((a == selected) != (b == selected)) return b == selected;
+      if (highlighted(a) != highlighted(b)) return highlighted(b);
       return entries[a].bss.rssi < entries[b].bss.rssi;
     });
-    struct Label { uint64_t key; float cx, yt, alpha; };
     std::vector<Label> names;
     target->PushAxisAlignedClip(D2D1::RectF(ax, y0 - 18 * ui, x1, y1), D2D1_ANTIALIAS_MODE_ALIASED);
     for (uint64_t k : order) {
       const Entry & e = entries[k];
       const wlan::Bss & b = e.bss;
       const bool faded = e.heard + FadeAfterMs < now;
-      const bool dimmed = selected && k != selected;
+      const bool lit = highlighted(k), dimmed = anySelection() && !lit;
       const float alpha = faded ? 0.3f : dimmed ? 0.35f : 1;
       auto shape = [&](int center, int width) {
         const double half = width / 2.0, slope = std::min(width * 0.12, 4.0);
@@ -576,55 +845,77 @@ namespace {
         s->EndFigure(D2D1_FIGURE_END_OPEN);
         s->Close();
         s->Release();
-        brush->SetColor(rgb(e.color, 0.10f * alpha + (k == selected ? 0.12f : 0)));
+        brush->SetColor(rgb(e.color, 0.10f * alpha + (lit ? 0.12f : 0)));
         target->FillGeometry(g, brush);
         brush->SetColor(rgb(e.color, alpha));
-        target->DrawGeometry(g, brush, (k == selected ? 2.5f : 1.3f) * ui);
+        target->DrawGeometry(g, brush, (lit ? 2.5f : 1.3f) * ui);
         g->Release();
-        // its name, placed after all the shapes are drawn
-        if (!dimmed || k == selected)
-          names.push_back({ k, (lt + rt) / 2, yt, alpha });
+        if (!dimmed) names.push_back({ k, (lt + rt) / 2, yt, alpha, false });
       };
       if (b.split) { shape(b.center, 80); shape(b.center2, 80); }
       else shape(b.center, b.width);
     }
+    placeLabels(names, ax, x1, y0, y1);
+    target->PopAxisAlignedClip();
+    brush->SetColor(rgb(0x2A3540));
+    target->DrawRectangle(D2D1::RectF(ax, y0, x1, y1), brush, 1);
+  }
 
-    // the names: the strongest (and the selected) placed first, just above
-    // their shapes; one that would overlap another moves up a line, or down,
-    // with a thin line to its shape when it has moved
-    std::sort(names.begin(), names.end(), [&](const Label & a, const Label & b) {
-      if ((a.key == selected) != (b.key == selected)) return a.key == selected;
-      return a.yt < b.yt;
-    });
-    std::vector<D2D1_RECT_F> placed;
-    const float lh = 15 * ui;
-    for (const Label & l : names) {
-      const Entry & e = entries[l.key];
-      const std::wstring name = e.bss.ssid.empty() ? L"(hidden)" : e.bss.ssid;
-      const float tw = textWidth(name, fontSmall) + 8 * ui;
-      float left = std::max(ax + 1, std::min(x1 - tw - 1, l.cx - tw / 2));
-      D2D1_RECT_F box = {};
-      bool found = false;
-      for (int step : { 0, -1, -2, -3, 1, 2, 3, 4, -4, 5, 6 }) {
-        const float top = l.yt - 17 * ui + step * (lh + 1 * ui);
-        if (top < y0 - 17 * ui || top + lh > y1) continue;
-        const D2D1_RECT_F r = D2D1::RectF(left, top, left + tw, top + lh);
-        bool clash = false;
-        for (const auto & q : placed)
-          if (r.left < q.right && q.left < r.right && r.top < q.bottom && q.top < r.bottom) { clash = true; break; }
-        if (!clash) { box = r; found = true; break; }
-      }
-      if (!found) continue;                  // (no room: the table has it)
-      placed.push_back(box);
-      if (std::fabs(box.bottom - (l.yt - 2 * ui)) > 1 * ui) {
-        brush->SetColor(rgb(e.color, 0.5f * l.alpha));
-        const float ly = box.bottom < l.yt ? box.bottom : box.top;
-        target->DrawLine(D2D1::Point2F(l.cx, ly), D2D1::Point2F(l.cx, l.yt), brush, 1);
-      }
-      brush->SetColor(rgb(0x0E1318, 0.8f * l.alpha));
-      target->FillRectangle(box, brush);
-      text(name, fontSmall, D2D1::RectF(box.left, box.top + 1 * ui, box.right, box.bottom), e.color, l.alpha, DWRITE_TEXT_ALIGNMENT_CENTER);
+  // Signal over the last five minutes: a line for each network, broken where
+  // it wasn't heard; its name at its newest point.
+  void drawTime()
+  {
+    const ULONGLONG now = GetTickCount64();
+    const float x0 = 10 * ui, x1 = W - 10 * ui - 150 * ui;          // (room for names on the right)
+    const float y0 = graphTop + 22 * ui, y1 = H - 26 * ui;
+    const float ax = x0 + 34 * ui;
+    const double span = HistorySeconds * 1000.0;
+    auto fx = [&](ULONGLONG t) { return (float) (ax + (1 - (double) (now - std::min(now, t)) / span) * (x1 - ax)); };
+    auto fy = [&](double db) { return (float) (y0 + (dbTop - db) / (dbTop - dbBottom) * (y1 - y0)); };
+
+    text(L"Signal over the last 5 minutes", fontBold, D2D1::RectF(x0, graphTop, viewTab[0].left - 8 * ui, y0), 0xB8C6D6);
+    drawDbGrid(x0, ax, x1, y0, y1);
+    for (int s = 0; s <= HistorySeconds; s += 30) {
+      const float x = (float) (ax + (1 - s * 1000.0 / span) * (x1 - ax));
+      brush->SetColor(rgb(0xFFFFFF, 0.05f));
+      target->DrawLine(D2D1::Point2F(x, y0), D2D1::Point2F(x, y1), brush, 1);
+      const std::wstring label = s == 0 ? L"now" : s % 60 == 0 ? format(L"%d min", s / 60) : format(L"%d:%02d", s / 60, s % 60);
+      text(label, fontSmall, D2D1::RectF(x - 30 * ui, y1 + 4 * ui, x + 30 * ui, y1 + 22 * ui), 0x8FA3B8, 1, DWRITE_TEXT_ALIGNMENT_CENTER);
     }
+
+    std::vector<uint64_t> order(shown);
+    std::sort(order.begin(), order.end(), [&](uint64_t a, uint64_t b) {
+      if (highlighted(a) != highlighted(b)) return highlighted(b);
+      return entries[a].bss.rssi < entries[b].bss.rssi;
+    });
+    std::vector<Label> names;
+    target->PushAxisAlignedClip(D2D1::RectF(ax, y0 - 18 * ui, W - 10 * ui, y1), D2D1_ANTIALIAS_MODE_ALIASED);
+    for (uint64_t k : order) {
+      const Entry & e = entries[k];
+      if (e.history.empty()) continue;
+      const bool lit = highlighted(k), dimmed = anySelection() && !lit;
+      const bool faded = e.heard + FadeAfterMs < now;
+      const float alpha = dimmed ? 0.22f : faded ? 0.4f : 0.9f;
+      brush->SetColor(rgb(e.color, alpha));
+      const float width = (lit ? 2.6f : 1.4f) * ui;
+      const std::pair<ULONGLONG, int> * prev = nullptr;
+      for (const auto & pt : e.history) {
+        const float x = fx(pt.first), y = fy(std::max(dbBottom, std::min(dbTop, (double) pt.second)));
+        if (prev && pt.first - prev->first <= (ULONGLONG) GapMs)
+          target->DrawLine(D2D1::Point2F(fx(prev->first), fy(std::max(dbBottom, std::min(dbTop, (double) prev->second)))), D2D1::Point2F(x, y), brush, width);
+        else
+          target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), width, width), brush);
+        prev = &pt;
+      }
+      // (still being heard: carried on to "now")
+      if (!faded && prev) {
+        const float y = fy(std::max(dbBottom, std::min(dbTop, (double) prev->second)));
+        target->DrawLine(D2D1::Point2F(fx(prev->first), y), D2D1::Point2F(x1, y), brush, width);
+      }
+      if (!dimmed && !faded && prev)
+        names.push_back({ k, x1, fy(std::max(dbBottom, std::min(dbTop, (double) prev->second))), alpha, true });
+    }
+    placeLabels(names, ax, W - 10 * ui, y0, y1);
     target->PopAxisAlignedClip();
     brush->SetColor(rgb(0x2A3540));
     target->DrawRectangle(D2D1::RectF(ax, y0, x1, y1), brush, 1);
@@ -647,9 +938,14 @@ namespace {
     target->Clear(rgb(0x0B1015));
     drawTop();
     drawTable();
-    for (const Pane & p : panes) drawPane(p);
-    if (panes.empty())
-      text(L"Choose a band at the top right.", fontText, D2D1::RectF(0, graphTop + 40 * ui, W, graphTop + 70 * ui), 0x8FA3B8, 1, DWRITE_TEXT_ALIGNMENT_CENTER);
+    if (timeView) drawTime();
+    else {
+      for (const Pane & p : panes) drawPane(p);
+      if (panes.empty())
+        text(L"Choose a band at the top right.", fontText, D2D1::RectF(0, graphTop + 40 * ui, W, graphTop + 70 * ui), 0x8FA3B8, 1, DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+    pill(viewTab[0], L"Channels", !timeView);
+    pill(viewTab[1], L"Signal over time", timeView);
     if (target->EndDraw() == D2DERR_RECREATE_TARGET) {
       brush->Release(); brush = nullptr;
       target->Release(); target = nullptr;
@@ -679,6 +975,13 @@ namespace {
     return i < (int) rows.size() ? i : -1;
   }
 
+  void selectRow(int i)
+  {
+    const Row & r = rows[i];
+    if (r.summary) { selectedGroup = groups[r.group].id; selected = 0; }
+    else { selected = r.key; selectedGroup = 0; }
+  }
+
   void copyText(const std::wstring & s)
   {
     if (!OpenClipboard(window)) return;
@@ -698,7 +1001,7 @@ namespace {
     return format(L"%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s",
                   b.ssid.c_str(), macText(b.mac).c_str(), e.vendor.c_str(), b.rssi, b.channel,
                   (b.split ? std::wstring(L"80+80") : format(L"%d", b.width)).c_str(),
-                  (b.band == 2 ? L"2.4" : b.band == 5 ? L"5" : L"6"), wifiName(b).c_str(), b.security.c_str(),
+                  bandName(b.band), wifiName(b).c_str(), b.security.c_str(),
                   rateText(b.maxRate).c_str(), b.phy.c_str());
   }
 
@@ -707,12 +1010,17 @@ namespace {
     const int r = rowAt((float) y);
     HMENU menu = CreatePopupMenu();
     if (r >= 0) {
-      selected = rows[r];
-      AppendMenuW(menu, MF_STRING, 1, L"Copy BSSID");
-      AppendMenuW(menu, MF_STRING, 2, L"Copy this row");
+      selectRow(r);
+      if (rows[r].summary) AppendMenuW(menu, MF_STRING, 2, L"Copy this router's radios");
+      else {
+        AppendMenuW(menu, MF_STRING, 1, L"Copy BSSID");
+        AppendMenuW(menu, MF_STRING, 2, L"Copy this row");
+      }
     }
     AppendMenuW(menu, MF_STRING, 3, L"Copy all rows");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | (grouped ? MF_CHECKED : 0), 5, L"Group by router\tG");
+    AppendMenuW(menu, MF_STRING | (timeView ? MF_CHECKED : 0), 6, L"Signal over time\tT");
     AppendMenuW(menu, MF_STRING, 4, L"Scan now\tF5");
     POINT p = { x, y };
     ClientToScreen(window, &p);
@@ -720,14 +1028,22 @@ namespace {
     const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, window, nullptr);
     DestroyMenu(menu);
     const std::wstring header = L"SSID\tBSSID\tVendor\tdBm\tChannel\tWidth\tBand\tWi-Fi\tSecurity\tMax Mbps\tPHY\r\n";
-    if (cmd == 1 && r >= 0) copyText(macText(entries[rows[r]].bss.mac));
-    else if (cmd == 2 && r >= 0) copyText(header + rowText(entries[rows[r]]));
+    if (cmd == 1 && r >= 0) copyText(macText(entries[rows[r].key].bss.mac));
+    else if (cmd == 2 && r >= 0) {
+      std::wstring out = header;
+      if (rows[r].summary) for (uint64_t k : groups[rows[r].group].members) out += rowText(entries[k]) + L"\r\n";
+      else out += rowText(entries[rows[r].key]);
+      copyText(out);
+    }
     else if (cmd == 3) {
       std::wstring all = header;
-      for (uint64_t k : rows) all += rowText(entries[k]) + L"\r\n";
+      for (uint64_t k : shown) all += rowText(entries[k]) + L"\r\n";
       copyText(all);
     }
     else if (cmd == 4) wlan::scan();
+    else if (cmd == 5) { grouped = !grouped; scroll = 0; saveSettings(); }
+    else if (cmd == 6) { timeView = !timeView; saveSettings(); }
+    InvalidateRect(window, nullptr, FALSE);
   }
 
   LRESULT CALLBACK proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -769,12 +1085,15 @@ namespace {
         const float x = (float) GET_X_LPARAM(lParam), y = (float) GET_Y_LPARAM(lParam);
         SetFocus(hwnd);
         for (int i = 0; i < 3; ++i)
-          if (x >= bandPill[i].left && x <= bandPill[i].right && y >= bandPill[i].top && y <= bandPill[i].bottom) {
+          if (inside(bandPill[i], x, y)) {
             showBand[i] = !showBand[i];
             saveSettings();
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
           }
+        if (inside(groupPill, x, y)) { grouped = !grouped; scroll = 0; saveSettings(); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+        for (int i = 0; i < 2; ++i)
+          if (inside(viewTab[i], x, y)) { timeView = i == 1; saveSettings(); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
         if (y >= tableBottom - 2 * ui && y <= tableBottom + 6 * ui) { dragging = true; SetCapture(hwnd); return 0; }
         if (y >= tableTop && y < tableTop + headH) {
           for (int c = ColCount - 1; c >= 0; --c)
@@ -788,8 +1107,19 @@ namespace {
           return 0;
         }
         const int r = rowAt(y);
-        if (r >= 0) selected = rows[r] == selected ? 0 : rows[r];
-        else if (y > tableBottom) selected = 0;
+        if (r >= 0) {
+          const Row row = rows[r];
+          if (row.summary) {
+            // a router's row: open or close it (and pick it out on the graphs)
+            const uint64_t id = groups[row.group].id;
+            if (opened.count(id)) opened.erase(id); else opened.insert(id);
+            selectedGroup = id;
+            selected = 0;
+          }
+          else if (row.key == selected) selected = 0;
+          else { selected = row.key; selectedGroup = 0; }
+        }
+        else if (y > tableBottom) { selected = 0; selectedGroup = 0; }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
@@ -817,19 +1147,29 @@ namespace {
         return 0;
       case WM_KEYDOWN: {
         int i = -1;
-        for (size_t k = 0; k < rows.size(); ++k) if (rows[k] == selected) i = (int) k;
+        for (size_t k = 0; k < rows.size(); ++k)
+          if (rows[k].summary ? (selectedGroup && groups[rows[k].group].id == selectedGroup && !selected)
+                              : (selected && rows[k].key == selected)) i = (int) k;
         if (wParam == VK_DOWN || wParam == VK_UP) {
           if (!rows.empty()) {
             i = std::max(0, std::min((int) rows.size() - 1, i + (wParam == VK_DOWN ? 1 : -1)));
-            selected = rows[i];
+            selectRow(i);
             if (i < scroll) scroll = i;
             if (i >= scroll + visibleRows()) scroll = i - visibleRows() + 1;
           }
         }
-        else if (wParam == VK_ESCAPE) selected = 0;
+        else if ((wParam == VK_RIGHT || wParam == VK_RETURN) && i >= 0 && rows[i].summary) opened.insert(groups[rows[i].group].id);
+        else if (wParam == VK_LEFT && i >= 0) {
+          const uint64_t id = groups[rows[i].group].id;
+          opened.erase(id);
+          if (!rows[i].summary && groups[rows[i].group].members.size() > 1) { selectedGroup = id; selected = 0; }
+        }
+        else if (wParam == VK_ESCAPE) { selected = 0; selectedGroup = 0; }
         else if (wParam == VK_F5) wlan::scan();
         else if (wParam == VK_PRIOR) scroll -= visibleRows();
         else if (wParam == VK_NEXT) scroll += visibleRows();
+        else if (wParam == 'G') { grouped = !grouped; scroll = 0; saveSettings(); }
+        else if (wParam == 'T') { timeView = !timeView; saveSettings(); }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
@@ -868,6 +1208,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int show)
     unsigned int r1 = 0, r2 = 0;
     rand_s(&r1); rand_s(&r2);
     demoSalt = ((uint64_t) r1 << 32) | r2;
+    makeDemoTables();
   }
   D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &d2d);
   DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown **) &dwrite);
@@ -892,6 +1233,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int show)
     if (swscanf_s(setting(L"Bands").c_str(), L"%d %d %d", &a, &b, &c) == 3) { showBand[0] = a; showBand[1] = b; showBand[2] = c; }
     const std::wstring s = setting(L"Split");
     if (!s.empty()) split = std::max(0.15f, std::min(0.85f, (float) _wtof(s.c_str())));
+    grouped = setting(L"Grouped") == L"1";
+    timeView = setting(L"Graph") == L"time";
   }
 
   WNDCLASSEXW wc = { sizeof(wc) };

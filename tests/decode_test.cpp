@@ -1,5 +1,6 @@
 // Checks of the beacon decoder (wlan::decode) on hand-made information elements.
 // A console program: prints each check, and exits with the number of failures.
+#include "../src/Advice.h"
 #include "../src/Wlan.h"
 
 #include <cstdio>
@@ -157,6 +158,41 @@ int main()
   check(wlan::frequencyOf(2, 1) == 2412 && wlan::frequencyOf(2, 14) == 2484, "2.4 GHz channels 1 and 14");
   check(wlan::frequencyOf(5, 36) == 5180 && wlan::frequencyOf(5, 165) == 5825, "5 GHz channels 36 and 165");
   check(wlan::frequencyOf(6, 1) == 5955 && wlan::frequencyOf(6, 2) == 5935 && wlan::frequencyOf(6, 233) == 7115, "6 GHz channels 1, 2 and 233");
+
+  // the quietest channel (advice::rank)
+  {
+    auto radio = [](int band, int channel, int width, int rssi, int util = -1) {
+      advice::Radio r;
+      r.band = band; r.width = width; r.rssi = rssi; r.utilization = util;
+      r.center = advice::mhz(band, channel);
+      return r;
+    };
+    using V = std::vector<advice::Radio>;
+    auto best = [](int band, const V & v) { return advice::rank(band, v).front(); };
+    check(best(2, V{ radio(2, 1, 20, -50), radio(2, 11, 20, -50), radio(2, 6, 20, -85) }).first == 6,
+          "2.4 GHz: loud neighbors on 1 and 11, a faint one on 6: 6");
+    check(best(2, V{}).first == 1, "2.4 GHz, nothing heard: 1 (ties go to the lower channel)");
+    check(best(2, V{ radio(2, 3, 20, -55) }).first == 11, "2.4 GHz: a neighbor on 3 overlaps 1 and 6: 11");
+    {
+      auto order = advice::rank(2, V{ radio(2, 1, 20, -60, 90), radio(2, 6, 20, -60, 10), radio(2, 11, 20, -60, 50) });
+      check(order[0].first == 6 && order[1].first == 11 && order[2].first == 1, "2.4 GHz, equal signals: the least busy first (6, 11, 1)");
+    }
+    {
+      auto order = advice::rank(5, V{ radio(5, 42, 80, -60), radio(5, 155, 80, -60) });
+      bool firstPlain = false;
+      for (auto & c : order) if (!c.dfs) { firstPlain = c.crowding > 0; break; }
+      check(order[0].dfs && order[0].first == 52 && firstPlain, "5 GHz: 36-48 and 149-161 taken: 52-64 (radar rules), the ordinary ones crowded");
+    }
+    check(best(5, V{ radio(5, 155, 80, -80) }).first == 36, "5 GHz: only a faint 149-161 neighbor: 36-48");
+    {
+      advice::Radio r = radio(5, 42, 80, -55);
+      r.center2 = advice::mhz(5, 155);
+      auto order = advice::rank(5, V{ r });
+      check(order.back().first == 36 || order.back().first == 149, "5 GHz 80+80 neighbor: both of its parts crowded");
+      check(order[order.size() - 1].crowding > 0 && order[order.size() - 2].crowding > 0, "80+80: two blocks crowded, not one");
+    }
+    check(best(6, V{ radio(6, 7, 80, -50) }).first == 17, "6 GHz: a neighbor on 1-13: 17-29");
+  }
 
   printf("%d failure(s)\n", failures);
   return failures;
