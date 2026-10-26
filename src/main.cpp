@@ -6,6 +6,7 @@
 // rates, load, Wi-Fi 7 multi-link) is decoded there.  Drawing: Direct2D and
 // DirectWrite, in pixels; `ui` scales what needs it to the monitor's DPI.
 
+#define _CRT_RAND_S                        // (rand_s, for the demo mode's salt)
 #include <windows.h>
 #include <windowsx.h>
 #include <shlobj.h>
@@ -17,6 +18,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <string>
@@ -66,8 +68,8 @@ namespace {
   enum Column { ColSsid, ColBssid, ColVendor, ColSignal, ColChannel, ColWidth, ColBand, ColWifi, ColSecurity, ColMax, ColMin, ColClients, ColUtil, ColSeen, ColCount };
   struct ColumnInfo { const wchar_t * name; float width; bool right; };
   const ColumnInfo columns[ColCount] = {
-    { L"SSID", 200, false }, { L"BSSID", 136, false }, { L"Vendor", 170, false }, { L"Signal", 110, false }, { L"Channel", 78, true },
-    { L"Width", 70, true }, { L"Band", 62, true }, { L"Wi-Fi", 64, true }, { L"Security", 132, false },
+    { L"SSID", 186, false }, { L"BSSID", 132, false }, { L"Vendor", 158, false }, { L"Signal", 110, false }, { L"Channel", 78, true },
+    { L"Width", 70, true }, { L"Band", 62, true }, { L"Wi-Fi", 64, true }, { L"Security", 124, false },
     { L"Max rate", 84, true }, { L"Min", 52, true }, { L"Clients", 62, true }, { L"Busy", 54, true }, { L"Seen", 58, true },
   };
   int sortColumn = ColSignal;
@@ -184,10 +186,51 @@ namespace {
     return same >= 4;
   }
 
+  // Demo mode (WiFiScope --demo), for screenshots that can be shared: every
+  // name is replaced by a made-up one and the last three bytes of every
+  // address by a hash with a salt chosen at random each run - so neither the
+  // neighbors' names nor the addresses (which Wi-Fi maps can locate) show.
+  // The makers' part of the addresses stays, so the Vendor column still works.
+  bool demo = false;
+  uint64_t demoSalt = 0;
+  std::map<std::wstring, std::wstring> demoNames;
+
+  void disguise(uint8_t * mac)
+  {
+    uint64_t h = demoSalt;
+    for (int i = 0; i < 6; ++i) h = (h ^ mac[i]) * 0x100000001B3ull;
+    h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 32;
+    mac[3] = (uint8_t) h; mac[4] = (uint8_t) (h >> 8); mac[5] = (uint8_t) (h >> 16);
+  }
+
+  void disguise(wlan::Bss & b)
+  {
+    static const wchar_t * names[] = {
+      L"Maple House", L"Blue Heron", L"Casa Verde", L"Nighthawk", L"Juniper", L"Saguaro", L"The Burrow",
+      L"Starlight", L"Coyote Den", L"Lakeside", L"Copper Ridge", L"Bluebird", L"Quail Run", L"Desert Rose",
+      L"Mesquite", L"Ironwood", L"Palo Verde", L"Sunset 5G", L"Granite Peak", L"Red Rock", L"Ocotillo",
+      L"Thunderbird", L"Hummingbird", L"Pinecone", L"Riverbend", L"Cactus Flower", L"Willow", L"Aspen",
+      L"Canyon View", L"Moonbeam", L"Roadrunner", L"Sycamore", L"Tumbleweed", L"Agave", L"Monsoon",
+    };
+    if (!b.ssid.empty()) {
+      auto it = demoNames.find(b.ssid);
+      if (it == demoNames.end()) {
+        const size_t n = demoNames.size();
+        std::wstring name = names[(n + (size_t) (demoSalt % _countof(names))) % _countof(names)];
+        if (n >= _countof(names)) name += format(L" %d", (int) (n / _countof(names)) + 1);
+        it = demoNames.emplace(b.ssid, name).first;
+      }
+      b.ssid = it->second;
+    }
+    disguise(b.mac);
+    if (b.multiLink) disguise(b.mld);
+  }
+
   void refresh()
   {
     const ULONGLONG now = GetTickCount64();
-    for (const wlan::Bss & b : wlan::networks()) {
+    for (wlan::Bss b : wlan::networks()) {
+      if (demo) disguise(b);
       const uint64_t key = keyOf(b.mac);
       Entry & e = entries[key];
       if (!e.color) e.color = colorFor(key) | 1;
@@ -209,6 +252,12 @@ namespace {
       else ++it;
     }
     connected = wlan::connectedBssid();
+    if (demo && connected.size() == 17) {
+      uint8_t m[6];
+      for (int i = 0; i < 6; ++i) m[i] = (uint8_t) wcstoul(connected.substr(i * 3, 2).c_str(), nullptr, 16);
+      disguise(m);
+      connected = macText(m);
+    }
 
     // the makers.  A made-up ("locally administered") address has none of its
     // own: if another network's registered address shares its second and third
@@ -812,8 +861,14 @@ namespace {
   }
 }
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int show)
 {
+  if (commandLine && wcsstr(commandLine, L"--demo")) {
+    demo = true;
+    unsigned int r1 = 0, r2 = 0;
+    rand_s(&r1); rand_s(&r2);
+    demoSalt = ((uint64_t) r1 << 32) | r2;
+  }
   D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &d2d);
   DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown **) &dwrite);
 
@@ -861,7 +916,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
   makeFonts();
 
   filterBox = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 10, 10, hwnd, nullptr, instance, nullptr);
-  SendMessageW(filterBox, EM_SETCUEBANNER, TRUE, (LPARAM) L"Filter by name or BSSID");
+  SendMessageW(filterBox, EM_SETCUEBANNER, TRUE, (LPARAM) L"Filter by name, BSSID or vendor");
   HFONT editFont = CreateFontW((int) (-13 * ui), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
   SendMessageW(filterBox, WM_SETFONT, (WPARAM) editFont, TRUE);
 

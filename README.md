@@ -43,13 +43,26 @@ signal, the way inSSIDer does. Click a row to pick it out on the graphs.
   (tab-separated, for a spreadsheet), and **Scan now**.
 - Keys: **↑ ↓** select, **Esc** clear the selection, **Page Up/Down** scroll,
   **F5** scan now.
+- **Sharing a screenshot?** Start it as `WiFiScope.exe --demo`: every network
+  name is replaced by a made-up one and every address scrambled (a new random
+  key each run), because BSSIDs can be looked up on Wi-Fi maps to find where
+  they are - and the names are your neighbors'. The screenshot above was made
+  that way.
 
 It scans every five seconds; Windows decides when a scan actually happens, so
 some networks update less often.
 
+## Download
+
+Get **WiFiScope-1.0-setup.exe** (installs for your user only, no admin rights
+needed; adds a Start menu entry and an uninstaller) or just **WiFiScope.exe**
+(run it from anywhere) from the [Releases](../../releases) page. Neither is
+code-signed, so Windows SmartScreen may warn the first time: choose
+**More info**, then **Run anyway**.
+
 ## What it needs
 
-- Windows 10 or 11, 64-bit. Single exe, no installer, nothing to install.
+- Windows 10 or 11, 64-bit. One exe, no runtime or DLLs to install.
 - **Location access** must be on for desktop apps (Settings > Privacy &
   security > Location > "Let desktop apps access your location"). Windows
   treats Wi-Fi scanning as location information; without it the list stays
