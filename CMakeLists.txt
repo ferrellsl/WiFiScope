@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")   # no runtime DLLs to ship
 
-add_executable(WiFiScope WIN32 src/main.cpp src/Wlan.cpp src/Wlan.h res/WiFiScope.rc)
+add_executable(WiFiScope WIN32 src/main.cpp src/Wlan.cpp src/Wlan.h src/Oui.cpp src/Oui.h res/WiFiScope.rc)
 target_link_libraries(WiFiScope PRIVATE d2d1 dwrite dwmapi wlanapi shell32 ole32)
 target_compile_definitions(WiFiScope PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS NOMINMAX)
 target_compile_options(WiFiScope PRIVATE /W3 /utf-8)

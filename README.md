@@ -10,8 +10,14 @@ are crowded and pick a better one for your router.
 
 For each access point (each radio of each router):
 
-- **Name and BSSID** (the radio's MAC address). Your own network is marked with
+- **Name, BSSID and Vendor**: the radio's MAC address and who made it (from the
+  IEEE registry, built in). Your own network is marked with
   a dot. A ≡ after the BSSID marks a **Wi-Fi 7 multi-link** router.
+  The vendor is whoever made the Wi-Fi hardware, which for many devices is a
+  module maker (Foxconn / Hon Hai, Espressif, Realtek...) rather than the
+  brand on the box. Made-up ("locally administered") addresses have no maker:
+  WiFiScope shows them as a router's **extra network** (guest, IoT, mesh) when
+  they match a router it hears, otherwise as a **private address**.
 - **Signal** in dBm, with a bar: green above −60, yellow to −70, orange to −80,
   red below.
 - **Channel, width and band**: the primary channel and the whole channel's width
@@ -58,6 +64,15 @@ some networks update less often.
 It shows Wi-Fi networks, not raw radio energy: interference from things that
 aren't Wi-Fi (microwave ovens, baby monitors, some cameras' analog links)
 needs dedicated spectrum-analyzer hardware.
+
+## Updating the vendor list
+
+Download the IEEE registry's ,  and
+ from https://standards-oui.ieee.org/ and run
+
+    python tools/make_oui.py oui.csv mam.csv oui36.csv
+
+which rewrites .
 
 ## Building
 

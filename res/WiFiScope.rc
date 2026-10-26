@@ -3,6 +3,8 @@
 
 1 ICON "WiFiScope.ico"
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "WiFiScope.manifest"
+// the makers of hardware addresses (IEEE registry; tools/make_oui.py)
+OUI RCDATA "oui.txt"
 
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION 1,0,0,0

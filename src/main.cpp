@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "Oui.h"
 #include "Wlan.h"
 
 #pragma comment(lib, "d2d1.lib")
@@ -44,6 +45,7 @@ namespace {
     wlan::Bss bss;
     ULONGLONG heard = 0;                   // GetTickCount64() of its last beacon
     uint32_t color = 0;
+    std::wstring vendor;                   // the maker, from the IEEE registry (or what made a made-up address)
     std::deque<std::pair<ULONGLONG, int>> history;   // (time, dBm)
   };
   std::map<uint64_t, Entry> entries;       // key: the BSSID
@@ -61,10 +63,10 @@ namespace {
   IDWriteTextFormat * fontText = nullptr, * fontBold = nullptr, * fontSmall = nullptr, * fontTitle = nullptr;
 
   // the view
-  enum Column { ColSsid, ColBssid, ColSignal, ColChannel, ColWidth, ColBand, ColWifi, ColSecurity, ColMax, ColMin, ColClients, ColUtil, ColSeen, ColCount };
+  enum Column { ColSsid, ColBssid, ColVendor, ColSignal, ColChannel, ColWidth, ColBand, ColWifi, ColSecurity, ColMax, ColMin, ColClients, ColUtil, ColSeen, ColCount };
   struct ColumnInfo { const wchar_t * name; float width; bool right; };
   const ColumnInfo columns[ColCount] = {
-    { L"SSID", 210, false }, { L"BSSID", 140, false }, { L"Signal", 110, false }, { L"Channel", 78, true },
+    { L"SSID", 200, false }, { L"BSSID", 136, false }, { L"Vendor", 170, false }, { L"Signal", 110, false }, { L"Channel", 78, true },
     { L"Width", 70, true }, { L"Band", 62, true }, { L"Wi-Fi", 64, true }, { L"Security", 132, false },
     { L"Max rate", 84, true }, { L"Min", 52, true }, { L"Clients", 62, true }, { L"Busy", 54, true }, { L"Seen", 58, true },
   };
@@ -156,7 +158,7 @@ namespace {
   void saveSettings()
   {
     auto put = [](const wchar_t * k, const std::wstring & v) { WritePrivateProfileStringW(L"WiFiScope", k, v.c_str(), settingsFile.c_str()); };
-    put(L"Sort", format(L"%d %d", sortColumn, sortDown ? 1 : 0));
+    put(L"Sort", format(L"%s %d", columns[sortColumn].name, sortDown ? 1 : 0));
     put(L"Bands", format(L"%d %d %d", showBand[0], showBand[1], showBand[2]));
     put(L"Split", format(L"%.3f", split));
     WINDOWPLACEMENT wp = { sizeof(wp) };
@@ -174,6 +176,14 @@ namespace {
   }
 
   // ------------------------------------------------------------- the data
+  bool sibling(const uint8_t * a, const uint8_t * b)
+  {
+    if (a[1] != b[1] || a[2] != b[2]) return false;
+    int same = 0;
+    for (int i = 1; i < 6; ++i) same += a[i] == b[i];
+    return same >= 4;
+  }
+
   void refresh()
   {
     const ULONGLONG now = GetTickCount64();
@@ -199,6 +209,27 @@ namespace {
       else ++it;
     }
     connected = wlan::connectedBssid();
+
+    // the makers.  A made-up ("locally administered") address has none of its
+    // own: if another network's registered address shares its second and third
+    // bytes and at least four of its last five, it's that router's extra network
+    // (guest, IoT, mesh - routers make those addresses from their own by
+    // changing a byte or two); otherwise it's a private address (a phone's
+    // hotspot and the like)
+    for (auto & [key, e] : entries) {
+      if (!e.vendor.empty() && !oui::local(e.bss.mac)) continue;   // (made-up ones: again, as their router may be heard later)
+      if (!oui::local(e.bss.mac)) {
+        e.vendor = oui::vendor(e.bss.mac);
+        continue;
+      }
+      std::wstring maker;
+      for (auto & [k2, other] : entries)
+        if (!oui::local(other.bss.mac) && sibling(other.bss.mac, e.bss.mac)) {
+          maker = oui::vendor(other.bss.mac);
+          if (!maker.empty()) break;
+        }
+      e.vendor = maker.empty() ? L"(private address)" : maker + L" (extra network)";
+    }
   }
 
   void sortRows()
@@ -207,7 +238,8 @@ namespace {
     rows.clear();
     for (auto & [key, e] : entries) {
       if (!showBand[bandIndex(e.bss.band)]) continue;
-      if (!f.empty() && lower(e.bss.ssid).find(f) == std::wstring::npos && macText(e.bss.mac).find(f) == std::wstring::npos)
+      if (!f.empty() && lower(e.bss.ssid).find(f) == std::wstring::npos && macText(e.bss.mac).find(f) == std::wstring::npos &&
+          lower(e.vendor).find(f) == std::wstring::npos)
         continue;
       rows.push_back(key);
     }
@@ -235,6 +267,10 @@ namespace {
         if (sx != sy) order = sx.empty() ? 1 : sy.empty() ? -1 : (sx < sy ? -1 : 1);   // (hidden ones last)
       }
       else if (sortColumn == ColBssid) order = a < b ? -1 : a > b ? 1 : 0;
+      else if (sortColumn == ColVendor) {
+        const std::wstring vx = lower(x.vendor), vy = lower(y.vendor);
+        if (vx != vy) order = vx.empty() ? 1 : vy.empty() ? -1 : (vx < vy ? -1 : 1);
+      }
       else if (sortColumn == ColSecurity) order = x.bss.security < y.bss.security ? -1 : x.bss.security > y.bss.security ? 1 : 0;
       else {
         const double vx = value(x, sortColumn), vy = value(y, sortColumn);
@@ -389,6 +425,7 @@ namespace {
       if (ours) name = L"● " + name;
       cell(ColSsid, name, b.ssid.empty() ? dim : fg, ours ? fontBold : nullptr);
       cell(ColBssid, macText(b.mac) + (b.multiLink ? L" ≡" : L""), dim);
+      cell(ColVendor, e.vendor, oui::local(b.mac) ? 0x8FA3B8 : 0xC8D6E5);
       // signal: the number, and a bar from -95 to -35 dBm
       {
         const float x = columnX(ColSignal) + 4 * ui, bw = 58 * ui;
@@ -609,8 +646,8 @@ namespace {
   std::wstring rowText(const Entry & e)
   {
     const wlan::Bss & b = e.bss;
-    return format(L"%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s",
-                  b.ssid.c_str(), macText(b.mac).c_str(), b.rssi, b.channel,
+    return format(L"%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s",
+                  b.ssid.c_str(), macText(b.mac).c_str(), e.vendor.c_str(), b.rssi, b.channel,
                   (b.split ? std::wstring(L"80+80") : format(L"%d", b.width)).c_str(),
                   (b.band == 2 ? L"2.4" : b.band == 5 ? L"5" : L"6"), wifiName(b).c_str(), b.security.c_str(),
                   rateText(b.maxRate).c_str(), b.phy.c_str());
@@ -633,7 +670,7 @@ namespace {
     InvalidateRect(window, nullptr, FALSE);
     const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, window, nullptr);
     DestroyMenu(menu);
-    const std::wstring header = L"SSID\tBSSID\tdBm\tChannel\tWidth\tBand\tWi-Fi\tSecurity\tMax Mbps\tPHY\r\n";
+    const std::wstring header = L"SSID\tBSSID\tVendor\tdBm\tChannel\tWidth\tBand\tWi-Fi\tSecurity\tMax Mbps\tPHY\r\n";
     if (cmd == 1 && r >= 0) copyText(macText(entries[rows[r]].bss.mac));
     else if (cmd == 2 && r >= 0) copyText(header + rowText(entries[rows[r]]));
     else if (cmd == 3) {
@@ -788,9 +825,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
     CoTaskMemFree(appData);
   }
   {
-    int c = sortColumn, down = 1;
-    if (swscanf_s(setting(L"Sort").c_str(), L"%d %d", &c, &down) == 2) { sortColumn = c; sortDown = down != 0; }
-    sortColumn = std::max(0, std::min((int) ColCount - 1, sortColumn));
+    // "Signal 1": the column's name, and 1 for descending
+    const std::wstring s = setting(L"Sort");
+    const size_t space = s.rfind(L' ');
+    if (space != std::wstring::npos)
+      for (int c = 0; c < ColCount; ++c)
+        if (s.compare(0, space, columns[c].name) == 0) { sortColumn = c; sortDown = s.substr(space + 1) != L"0"; }
   }
   {
     int a = 1, b = 1, c = 1;
