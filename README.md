@@ -11,8 +11,7 @@ are crowded and pick a better one for your router.
 For each access point (each radio of each router):
 
 - **Name, BSSID and Vendor**: the radio's MAC address and who made it (from the
-  IEEE registry, built in). Your own network is marked with
-  a dot. A ≡ after the BSSID marks a **Wi-Fi 7 multi-link** router.
+  IEEE registry, built in). Your own network is marked with a dot. A ≡ after the BSSID marks a **Wi-Fi 7 multi-link** router.
   The vendor is whoever made the Wi-Fi hardware, which for many devices is a
   module maker (Foxconn / Hon Hai, Espressif, Realtek...) rather than the
   brand on the box. Made-up ("locally administered") addresses have no maker:
@@ -38,7 +37,7 @@ signal, the way inSSIDer does. Click a row to pick it out on the graphs.
 
 - Click a column heading to sort; click again to reverse.
 - The **2.4 GHz / 5 GHz / 6 GHz** buttons show or hide a band; the box beside
-  them filters by name or BSSID.
+  them filters by name, BSSID or vendor.
 - Drag the line between the table and the graphs to resize them.
 - Right-click for **Copy BSSID**, **Copy this row** or **Copy all rows**
   (tab-separated, for a spreadsheet), and **Scan now**.
@@ -67,12 +66,12 @@ needs dedicated spectrum-analyzer hardware.
 
 ## Updating the vendor list
 
-Download the IEEE registry's ,  and
- from https://standards-oui.ieee.org/ and run
+Download the IEEE registry's `oui/oui.csv`, `oui28/mam.csv` and
+`oui36/oui36.csv` from https://standards-oui.ieee.org/ and run
 
     python tools/make_oui.py oui.csv mam.csv oui36.csv
 
-which rewrites .
+which rewrites `res/oui.txt`.
 
 ## Building
 
