@@ -54,6 +54,7 @@ namespace {
     uint32_t color = 0;
     std::wstring vendor;                   // the maker, from the IEEE registry (or what made a made-up address)
     std::deque<std::pair<ULONGLONG, int>> history;   // (time, dBm)
+    int openReports = 0;                   // reports in a row saying a secured network is open
   };
   std::map<uint64_t, Entry> entries;       // key: the BSSID
   std::wstring connected;                  // our network's BSSID
@@ -288,6 +289,20 @@ namespace {
       const ULONGLONG heard = now - std::min<ULONGLONG>(now, (ULONGLONG) b.ageMs);
       if (heard + 1000 < e.heard) continue;      // (an older copy, from another interface)
       const bool newer = heard > e.heard + 500 || e.history.empty();
+      // Windows sometimes passes on a report without the beacon's details, or with them cut
+      // short. Such a report keeps what was decoded before, and a secured network is shown as
+      // Open only once three reports in a row say so.
+      if (!b.details && e.bss.details) {
+        wlan::Bss kept = e.bss;
+        kept.rssi = b.rssi;
+        kept.ageMs = b.ageMs;
+        b = kept;
+      }
+      else if (b.security == L"Open" && !e.bss.security.empty() && e.bss.security != L"Open" &&
+               e.bss.security != L"?" && ++e.openReports < 3)
+        b.security = e.bss.security;
+      else if (b.security != L"Open")
+        e.openReports = 0;
       e.bss = b;
       e.heard = std::max(e.heard, heard);
       if (newer) e.history.push_back({ heard, b.rssi });

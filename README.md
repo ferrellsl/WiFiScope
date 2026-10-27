@@ -81,7 +81,7 @@ some networks update less often.
 
 ## Download
 
-Get **WiFiScope-1.1-setup.exe** (installs for your user only, no admin rights
+Get **WiFiScope-1.1.1-setup.exe** (installs for your user only, no admin rights
 needed; adds a Start menu entry and an uninstaller) or just **WiFiScope.exe**
 (run it from anywhere) from the [Releases](../../releases) page. Neither is
 code-signed, so Windows SmartScreen may warn the first time: choose

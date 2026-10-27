@@ -96,6 +96,7 @@ namespace wlan {
     std::vector<double> basic, all;
     bool akmPsk = false, akmSae = false, akm8021x = false, akmSuiteB = false, akmOwe = false;
     bool hasB = false, hasG = false;
+    b.details = size > 0;
 
     size_t at = 0;
     while (at + 2 <= size) {
@@ -287,6 +288,7 @@ namespace wlan {
     }
     else if (wpa1) b.security = L"WPA";
     else if (capabilities & 0x10) b.security = L"WEP";
+    else if (!b.details) b.security = L"?";
     else b.security = L"Open";
   }
 

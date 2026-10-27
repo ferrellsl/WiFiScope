@@ -32,6 +32,8 @@ namespace wlan {
     uint8_t mld[6] = {};               //   (the multi-link device's address, the same on all its radios)
     std::string country;               // "US", ...
     int ageMs = 0;                     // how long ago its last beacon was heard
+    bool details = false;              // the report carried the beacon's elements (some reports
+                                       //   don't: then width, security and the rest are unknown)
   };
 
   // Opens the API and starts scanning (a scan every few seconds); the window
