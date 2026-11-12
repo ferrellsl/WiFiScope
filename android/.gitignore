@@ -1,0 +1,11 @@
+.gradle/
+build/
+app/build/
+local.properties
+*.apk
+# the release key and its passwords are kept outside this public repository
+keystore.properties
+*.jks
+*.keystore
+# scans recorded for testing: neighbors' names and geolocatable addresses
+captures/

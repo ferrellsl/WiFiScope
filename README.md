@@ -1,11 +1,13 @@
 # WiFiScope
 
-A free Wi-Fi scanner for Windows: every network your adapter hears, in a table
-and on graphs of the 2.4, 5 and 6 GHz channels or of their signal over time,
-so you can see which channels are crowded and pick a better one for your
-router - WiFiScope suggests the quietest.
+A free Wi-Fi scanner for Windows and Android: every network your adapter
+hears, in a table and on graphs of the 2.4, 5 and 6 GHz channels or of their
+signal over time, so you can see which channels are crowded and pick a better
+one for your router - WiFiScope suggests the quietest.
 
 ![WiFiScope](docs/wifiscope.png)
+
+(The [Android app](#android) is below.)
 
 ## What it shows
 
@@ -98,6 +100,43 @@ code-signed, so Windows SmartScreen may warn the first time: choose
   AX211, BE200 and the like). Wi-Fi 7 features (320 MHz, multi-link) are
   decoded from the beacons of any band your adapter hears.
 
+## Android
+
+The same scanner for Android phones and tablets (Android 8 and later): the same
+table, columns, channel graphs, quietest-channel advice, signal over time,
+grouping by router and vendor list, decoded from the same beacon elements by
+a port of the Windows decoder that is checked against it on real recorded
+scans.
+
+![WiFiScope on Android](docs/wifiscope-android.png)
+
+- **Install**: download **WiFiScope-1.2.apk** from the [Releases](../../releases)
+  page on the phone or tablet and open it; Android asks once to allow installing
+  apps from your browser or file manager.
+- **Permissions**: Android shows apps the networks around only when they may use
+  the device's **location** (Android 12 and earlier) or **nearby devices**
+  (Android 13 and later); WiFiScope asks at the first start. Location (the
+  quick-settings tile) must be on too. Nothing leaves the device.
+- **How often it scans**: Android lets an app ask for only **4 scans in 2
+  minutes**; between them WiFiScope shows what the system's own scans heard, and
+  says how old the latest scan is. For a scan every 5 seconds, turn off
+  **Wi-Fi scan throttling** in Settings > Developer options (tap the banner for
+  how).
+- **Touch**: tap a row to pick it out on the graphs; press and hold it for
+  **Details** (streams, rates, country, multi-link address) and the copy
+  commands; swipe the table sideways for more columns (the names stay put); tap
+  a heading to sort; drag the bar under the table to resize it. On a phone the
+  graphs show one band at a time - choose it with the buttons above the graph.
+- **Sharing a screenshot?** Turn on **Demo mode** in the menu (made-up names,
+  scrambled addresses, as `--demo` on Windows).
+- Android 11 and later pass on each beacon's elements, so everything is
+  decoded as on Windows. On Android 8-10 (or a device whose driver leaves them
+  out), the width, security and generation come from Android's own summary and
+  the rate, clients and busy columns stay empty.
+
+The APK is signed but not from the Play Store, so Play Protect may ask whether
+to install it; choose **Install anyway**.
+
 ## What it can't do
 
 It shows Wi-Fi networks, not raw radio energy: interference from things that
@@ -122,6 +161,23 @@ Visual Studio 2019 or later with the C++ workload, and CMake:
 
 `build/Release/decode_test.exe` checks the beacon decoder and the channel
 advice (exit code = failures).
+
+The Android app (`android/`, Java, no libraries) builds with the Android SDK
+(platform 36) and JDK 17 or later, e.g. Android Studio's:
+
+    cd android
+    gradlew assembleRelease testDebugUnitTest
+
+The unit tests repeat `decode_test`'s checks on the Java decoder. To compare
+the two decoders on real beacons, record a scan on Windows with
+`build/Release/capture.exe android/captures/scan.txt` (the folder is ignored by
+git - the file holds your neighbors' names and addresses) and run the tests
+again: every network must decode the same on both. Pushed to the device as
+`Android/data/com.ferrellsl.wifiscope/files/capture.txt`, the same scan can be
+played back in the app (menu > Play back a recorded scan).
+
+Release builds are signed with a key from `make-key.ps1`, kept outside the
+repository (see `keystore.properties.example`).
 
 ## License
 
