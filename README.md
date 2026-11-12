@@ -110,7 +110,7 @@ scans.
 
 ![WiFiScope on Android](docs/wifiscope-android.png)
 
-- **Install**: download **WiFiScope-1.2.apk** from the [Releases](../../releases)
+- **Install**: download **WiFiScope-1.2.1.apk** from the [Releases](../../releases)
   page on the phone or tablet and open it; Android asks once to allow installing
   apps from your browser or file manager.
 - **Permissions**: Android shows apps the networks around only when they may use

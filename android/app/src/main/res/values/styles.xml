@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Scope" parent="@android:style/Theme.Material">
+    <style name="Scope" parent="@android:style/Theme.Material.NoActionBar">
         <item name="android:colorPrimary">#141A21</item>
         <item name="android:colorPrimaryDark">#0B1015</item>
         <item name="android:colorAccent">#2E86DE</item>

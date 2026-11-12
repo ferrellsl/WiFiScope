@@ -24,6 +24,8 @@ import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
+import android.widget.Toolbar;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -75,6 +77,30 @@ public final class MainActivity extends Activity implements ScopeView.Host {
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(0xFF0B1015);
+        // The title bar is ours, in the layout: Android 15 and later draw apps edge to
+        // edge, under the status and navigation bars, so the layout is padded by them
+        // (and by a camera cutout) instead.
+        Toolbar bar = new Toolbar(this);
+        bar.setBackgroundColor(0xFF141A21);
+        bar.setTitle("WiFiScope");
+        bar.setTitleTextColor(0xFFFFFFFF);
+        root.addView(bar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        setActionBar(bar);
+        root.setOnApplyWindowInsetsListener((v, insets) -> {
+            int l, t, r, b;
+            if (Build.VERSION.SDK_INT >= 30) {
+                android.graphics.Insets i = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                android.graphics.Insets ime = insets.getInsets(WindowInsets.Type.ime());
+                l = i.left; t = i.top; r = i.right; b = Math.max(i.bottom, ime.bottom);
+            } else {
+                l = insets.getSystemWindowInsetLeft(); t = insets.getSystemWindowInsetTop();
+                r = insets.getSystemWindowInsetRight(); b = insets.getSystemWindowInsetBottom();
+            }
+            v.setPadding(l, t, r, b);
+            return insets;
+        });
+        if (Build.VERSION.SDK_INT >= 30) getWindow().setDecorFitsSystemWindows(false);
         filterBox = new EditText(this);
         filterBox.setHint("Filter by name, BSSID or vendor");
         filterBox.setSingleLine(true);

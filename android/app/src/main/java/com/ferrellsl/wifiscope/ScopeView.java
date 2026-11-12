@@ -49,7 +49,8 @@ public final class ScopeView extends View {
     // the layout, set by layout()
     private float W, H, top, bannerH, tableTop, tableBottom, rowH, headH, graphTop, frozen, plotTop, titleTop;
     private final RectF[] bandPill = { new RectF(), new RectF(), new RectF() };
-    private final RectF groupPill = new RectF(), bannerBox = new RectF();
+    private final RectF groupPill = new RectF(), bannerBox = new RectF(), statusBox = new RectF();
+    private boolean compact;
     private final List<RectF> tabs = new ArrayList<>();
     private final List<String> tabNames = new ArrayList<>();
     private boolean narrow;
@@ -131,14 +132,18 @@ public final class ScopeView extends View {
         }
         groupPill.set(x - 92 * u, py, x, py + pillH);
         top = py + pillH + 8 * u;
-        bannerH = banner.isEmpty() ? 0 : 40 * u;
+        // a short screen (a phone held sideways): the banner's warning goes into the
+        // status line, and the table may shrink to a row so the graphs keep some room
+        compact = H < 420 * u;
+        bannerH = banner.isEmpty() || compact ? 0 : 40 * u;
+        statusBox.set(0, 0, narrow ? W : groupPill.left - 6 * u, narrow ? py : top);
         bannerBox.set(0, top, W, top + bannerH);
         headH = 32 * u;
         rowH = 34 * u;
         tableTop = top + bannerH;
         final float rest = H - tableTop;
-        final int fewest = rest < 420 * u ? 2 : 3;          // (a short screen: the graphs need the room)
-        tableBottom = tableTop + Math.max(headH + rowH * fewest, Math.min(rest - (narrow ? 190 : 150) * u, rest * split));
+        final int fewest = compact ? 1 : rest < 420 * u ? 2 : 3;   // (a short screen: the graphs need the room)
+        tableBottom = tableTop + Math.max(headH + rowH * fewest, Math.min(rest - (narrow ? 190 : compact ? 120 : 150) * u, rest * split));
         graphTop = tableBottom + 10 * u;
         // where the plots start: below the tabs and the band's line on a narrow screen;
         // beside the tabs (on the titles' line) otherwise, as on Windows
@@ -245,8 +250,10 @@ public final class ScopeView extends View {
         if (age >= 15) status += ", last scan " + (age < 120 ? age + " s" : age / 60 + " min") + " ago";
         if (!model.adapter.isEmpty()) status += "   •   " + model.adapter;
         if (model.demo()) status += "   •   demo: names and addresses disguised";
-        if (narrow) text(c, status, fontSmall, 12 * u, 6 * u, W - 12 * u, 28 * u, 0x9FB0C2, 1, 0);
-        else text(c, status, fontSmall, 12 * u, groupPill.top, groupPill.left - 12 * u, groupPill.bottom, 0x9FB0C2, 1, 0);
+        int statusColor = 0x9FB0C2;
+        if (compact && !banner.isEmpty()) { status = "⚠ " + banner + "   •   " + status; statusColor = 0xFFD98A; }
+        if (narrow) text(c, status, fontSmall, 12 * u, 6 * u, W - 12 * u, 28 * u, statusColor, 1, 0);
+        else text(c, status, fontSmall, 12 * u, groupPill.top, groupPill.left - 12 * u, groupPill.bottom, statusColor, 1, 0);
         pill(c, groupPill, "By router", model.grouped);
         final String[] names = { "2.4 GHz", "5 GHz", "6 GHz" };
         for (int i = 0; i < 3; ++i) pill(c, bandPill[i], names[i], model.showBand[i]);
@@ -470,11 +477,16 @@ public final class ScopeView extends View {
         else if (p.band == 5) for (int ch : narrow ? new int[] { 36, 52, 100, 116, 132, 149, 165 } : new int[] { 36, 44, 52, 60, 100, 108, 116, 124, 132, 140, 149, 157, 165, 173 }) labels.add(ch);
         else for (int ch = 1; ch <= 233; ch += narrow ? 32 : 32) labels.add(ch);
         line.setStrokeWidth(1);
+        float lastRight = -1e9f;                            // (a number that would touch the one before is left out)
         for (int ch : labels) {
             final float x = fx(p, Decoder.frequencyOf(p.band, ch), ax, x1);
             line.setColor(argb(0xFFFFFF, 0.05f));
             c.drawLine(x, y0, x, y1, line);
-            text(c, Integer.toString(ch), fontSmall, x - 20 * u, y1 + 3 * u, x + 20 * u, y1 + 24 * u, 0x8FA3B8, 1, 2);
+            final String s = Integer.toString(ch);
+            final float half = fontSmall.measureText(s) / 2;
+            if (x - half < lastRight + 5 * u) continue;
+            lastRight = x + half;
+            text(c, s, fontSmall, x - 20 * u, y1 + 3 * u, x + 20 * u, y1 + 24 * u, 0x8FA3B8, 1, 2);
         }
 
         // the networks: one shape across each one's channel, as high as its signal
@@ -647,6 +659,7 @@ public final class ScopeView extends View {
                 if (inside(bandPill[i], x, y)) { model.showBand[i] = !model.showBand[i]; changed(); return true; }
             if (inside(groupPill, x, y)) { model.grouped = !model.grouped; scrollY = 0; changed(); return true; }
             if (bannerH > 0 && inside(bannerBox, x, y)) { if (host != null) host.bannerTapped(); return true; }
+            if (compact && !banner.isEmpty() && inside(statusBox, x, y)) { if (host != null) host.bannerTapped(); return true; }
             for (int i = 0; i < tabs.size(); ++i)
                 if (inside(tabs.get(i), x, y)) {
                     final String n = tabNames.get(i);
